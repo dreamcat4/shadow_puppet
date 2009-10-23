@@ -1,94 +1,144 @@
 #!/usr/bin/env ruby
-#== Sample manifest:
-#
-#  $ cat examples/foo.rb
-#  class Foo < ShadowPuppet::Manifest
-#   recipe :demo, :text => 'foo'
-#   recipe :some_gems
-#
-#   def some_gems
-#     package 'rails', :ensure => :updated, :provider => :gem
-#     package 'railsmachine', :ensure => '1.0.5', :provider => :gem, :require => package('capistrano')
-#     package 'capistrano', :ensure => :updated, :provider => :gem
-#   end
-#
-#   def demo(options = {})
-#     exec 'sample', :command => "echo '#{options[:text]}' > /tmp/sample.txt"
-#     file '/tmp/sample2.txt', :ensure => :present, :content => Facter.to_hash.inspect
-#   end
-# end
-#
-#== Executing this manifest:
-#
-#  $ shadow_puppet examples/foo.rb
-#  notice: /shadow_puppet:19861340/Exec[foo]/returns: executed successfully
-#  $
-#
-#The shadow_puppet binary parses the given ruby code, which is
-#expected to contain a class named Foo that inherits from
-#ShadowPuppet::Manifest. An instance of this class is created, and the
-#<tt>execute</tt> method is called. All output is printed to the console.
 
 begin
 
+  require 'rubygems'
+  sp_version = Gem.loaded_specs["shadow_puppet"].version.to_s
+
+  require 'ostruct'
+  options = OpenStruct.new
+  options.config = nil
+  options.guess = true
+
   require 'optparse'
   opts = OptionParser.new do |opts|
-    opts.banner = <<-EOF
-    NAME
-      Shadow Puppet
 
-    AUTHOR
-      Jesse Newland
-      jesse@railsmachine.com
+    opts.banner =<<-EOF
+== Synopsis
 
-    DESCRIPTION
-      A Ruby DSL for puppet
+  shadow_puppet #{sp_version} - Command line program to execute SP Manifests.
 
-    EXAMPLES
-      Sample manifest:
+== Usage
 
-        #foo.rb
-        class Foo < ShadowPuppet::Manifest
-          recipe :foo
+    shadow_puppet MANIFEST_FILE[S] [CONFIG_FILES] [MANIFESTS]
 
-          def foo
-            exec :foo, :command => 'echo "foo" > /tmp/foo.txt'
-            file '/tmp/example.txt', :ensure => :present, :content => Facter.to_hash.inspect
-          end
-        end
+== Examples
 
-      Executing this manifest:
+  Execute ManifestClass from `manifest_file.rb` with config_file.yml:
+    shadow_puppet MANIFEST_FILE.rb CONFIG_FILE.yml ManifestClass
 
-        $ shadow_puppet foo.rb
-        notice: /shadow_puppet:19861340/Exec[foo]/returns: executed successfully
-        $
+  Execute MyManifest from my_manifest.rb with my_manifest.yml:
+    shadow_puppet my_manifest.rb my_manifest.yml
 
-      The shadow_puppet binary parses the given ruby code, which is
-      expected to contain a class named Foo that inherits from
-      ShadowPuppet::Manifest. An instance of this class is created, and the
-      execute method is called. All output is printed to the console.
-  EOF
+  Execute MyManifest from my_manifest.rb with someconf.yml:
+    shadow_puppet my_manifest.rb --config someconf.yml
+
+  Other examples:
+    shadow_puppet "Foo" "Bar" "Baz" mfest.rb --config c.yml
+    shadow_puppet manifest.rb -N Foo Bar Foo.yml Bar.yml
+
+== Notes
+
+  * Manifest filenames should be underscored, as any ruby script
+  * Conf file must be underscore and match a valid manifest name
+    (unless forced with --config filename.yml)
+  * Manifest class names may be either CamelCased or underscore
+  * Shadow Puppet will exit with error if no manifest is found.
+
+== Author
+
+  Jesse Newland - jesse@railsmachine.com
+
+== Options
+
+EOF
+
+    opts.on('-h','--help','Display help message') { puts opts; puts '' ; exit 0 }
+
+    opts.on('-v','--version','Display the version, then exit') {
+      puts "shadow_puppet - #{sp_version}" ; exit 0 }
+
+    opts.on( '-c', '--config FILE', 'Execute *all* manifests with .yml configuration FILE' ) { |file|
+      options.config = file }
+
+    opts.on( '-N', '--no-guess', 'Dont guess Manifest class names from their filename' ) {
+      options.guess = false }
 
   end
-
   opts.parse!
 
-  require 'rubygems'
   require 'shadow_puppet'
+
   require 'active_support/inflector'
   require 'active_support/core_ext/string/inflections'
+
   unless String.included_modules.include?(ActiveSupport::CoreExtensions::String::Inflections)
     String.send :include, ActiveSupport::CoreExtensions::String::Inflections
   end
   require 'fileutils'
 
-  filename = ARGV[0]
-  raise ArgumentError unless filename
+  raise ArgumentError if ARGV.empty?
 
-  klass = File.basename(filename, ".rb")
-  require filename
-  manifest = klass.classify.constantize.new
-  manifest.execute! && exit(0)
+  manifests  = []
+  conf_files = []
+
+  ARGV.each do |arg|
+    if File.exist?(arg)
+      file = arg
+      if file =~ /\.rb$/
+        require file
+        if options.guess
+          klass = File.basename(file, ".rb").underscore
+          m = klass.camelize.constantize
+          manifests << m if ShadowPuppet::Manifest >= m
+        end
+      elsif file =~ /\.yml$/
+        conf_files << file
+      else
+        raise "File #{file} not recognised as a valid input file"
+      end
+    else
+      raise "Can't find file: #{arg}" if arg =~ /\./
+      m = arg.camelize.constantize
+      if ShadowPuppet::Manifest >= m
+        manifests << m
+      else
+        raise "Class: #{m} is not a ShadowPuppet::Manifest"
+      end
+    end
+  end
+  raise "No class of type ShadowPuppet::Manifest to execute" if manifests.empty?
+
+  global_config = {}
+  if options.config
+    y = YAML.load_file(options.config)
+    if y.is_a?(Hash)
+      global_config = y
+    else
+      raise "Can't parse yaml configuration file: #{options.config}"
+    end
+  end
+
+  manifests.each do |m|
+    conf_matches = conf_files.select { |c| c =~ /#{m.to_s.underscore}/ }
+    if global_config.empty? && conf_matches.empty?
+      m.new().execute!
+    else
+      m_config = Hash.new(global_config)
+      conf_matches.each do |f|
+        y = YAML.load_file(f)
+        if y.is_a?(Hash)
+          m_config.merge! y if y.is_a?(Hash)
+        else
+          raise "Can't parse yaml configuration file: #{f}"
+        end
+      end
+      m.new(m_config).execute!
+    end
+
+  end
+  exit(0)
+
 rescue Errno::EACCES
   puts "Please run shadow_puppet as root"
 rescue Exception => e
